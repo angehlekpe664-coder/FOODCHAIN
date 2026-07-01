@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../state/app_state.dart';
 import '../theme.dart';
 import 'payment_success_screen.dart';
@@ -23,11 +25,54 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
   final _phoneController = TextEditingController(text: "+221 77 123 45 67");
   String _selectedCarrier = "Wave";
 
+  // Supabase states
+  bool _isLoadingPayment = true;
+  String _paymentUrl = "";
+  String _orderId = "";
+  RealtimeChannel? _realtimeChannel;
+
   @override
   void initState() {
     super.initState();
     if (widget.paymentMethod == "Lightning" || widget.paymentMethod == "Bitcoin") {
       _startCountdown();
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initiatePayment();
+    });
+  }
+
+  void _initiatePayment() async {
+    final state = Provider.of<AppState>(context, listen: false);
+    setState(() {
+      _isLoadingPayment = true;
+    });
+
+    final paymentData = await state.createRealPayment(widget.paymentMethod);
+
+    if (paymentData != null && paymentData['success'] == true) {
+      setState(() {
+        _orderId = paymentData['orderId'] ?? "";
+        _paymentUrl = paymentData['paymentUrl'] ?? "";
+        _isLoadingPayment = false;
+      });
+
+      // Souscrire aux modifications en direct pour cette commande spécifique
+      _realtimeChannel = state.subscribeToOrder(_orderId, (status) {
+        if (status == "paid") {
+          if (!mounted) return;
+          state.registerPaidOrder(_orderId, widget.paymentMethod, state.cartTotalCfa);
+          state.clearCart();
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute(builder: (context) => const PaymentSuccessScreen()),
+            (route) => route.isFirst,
+          );
+        }
+      });
+    } else {
+      setState(() {
+        _isLoadingPayment = false;
+      });
     }
   }
 
@@ -43,10 +88,22 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
     });
   }
 
+  Future<void> _launchPaymentUrl() async {
+    if (_paymentUrl.isNotEmpty) {
+      final uri = Uri.parse(_paymentUrl);
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+    }
+  }
+
   @override
   void dispose() {
     _timer?.cancel();
     _phoneController.dispose();
+    if (_realtimeChannel != null) {
+      Supabase.instance.client.removeChannel(_realtimeChannel!);
+    }
     super.dispose();
   }
 
@@ -56,20 +113,38 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
     return "${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}";
   }
 
-  void _simulateSuccessfulPayment(AppState state) {
+  void _simulateSuccessfulPayment(AppState state) async {
     setState(() {
       _isProcessing = true;
     });
 
-    // Simulate network delay
-    Timer(const Duration(milliseconds: 1500), () {
+    try {
+      // Appeler l'Edge Function izichange-webhook pour simuler le retour d'IzichangePay
+      await Supabase.instance.client.functions.invoke(
+        'izichange-webhook',
+        body: {
+          'event': 'payment_intent.completed',
+          'timestamp': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          'data': {
+            'intentId': 'simulated_intent_${_orderId}',
+            'merchantReference': _orderId,
+            'status': 'completed',
+            'amountRequested': state.cartTotalCfa.toString(),
+            'currencyRequested': 'XOF',
+          }
+        }
+      );
+    } catch (e) {
+      debugPrint("Erreur lors de la simulation du webhook: $e");
+      // Fallback local direct
+      state.registerPaidOrder(_orderId, widget.paymentMethod, state.cartTotalCfa);
+      state.clearCart();
       if (!mounted) return;
-      state.completePayment(widget.paymentMethod);
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(builder: (context) => const PaymentSuccessScreen()),
         (route) => route.isFirst,
       );
-    });
+    }
   }
 
   @override
@@ -215,9 +290,32 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
   }
 
   Widget _buildPaymentContent(AppState state) {
+    if (_isLoadingPayment) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 60.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: const [
+              CircularProgressIndicator(color: FoodChainTheme.primaryOrange),
+              SizedBox(height: 24),
+              Text(
+                "Génération du paiement IzichangePay...",
+                style: TextStyle(
+                  fontFamily: 'Outfit',
+                  fontSize: 16,
+                  color: FoodChainTheme.greyText,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (widget.paymentMethod == "Lightning") {
       // Mock invoice string representation
-      const invoiceString = "lnbc238u1p3x9wjspp5y...d7shw7s292ldns72gfh3k328hjl28x";
+      final invoiceString = _paymentUrl.isNotEmpty ? _paymentUrl : "lnbc238u1p3x9wjspp5y...d7shw7s292ldns72gfh3k328hjl28x";
       
       return Column(
         children: [
@@ -331,6 +429,41 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (_paymentUrl.isNotEmpty && !_paymentUrl.startsWith("https://mock.foodchain.com")) ...[
+            ElevatedButton.icon(
+              onPressed: _launchPaymentUrl,
+              icon: const Icon(Icons.open_in_browser, color: Colors.white),
+              label: const Text(
+                "Payer sur IzichangePay",
+                style: TextStyle(
+                  fontFamily: 'Outfit',
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                  color: Colors.white,
+                ),
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: FoodChainTheme.primaryOrange,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                elevation: 2,
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Center(
+              child: Text(
+                "OU",
+                style: TextStyle(
+                  fontFamily: 'Outfit',
+                  fontWeight: FontWeight.bold,
+                  color: FoodChainTheme.greyText,
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
           Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
@@ -426,7 +559,7 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
       );
     } else {
       // On-Chain Bitcoin
-      const address = "bc1q9x4y2u88jshw77s292ldns72gfh3k328hjl28x";
+      final address = _paymentUrl.isNotEmpty ? _paymentUrl : "bc1q9x4y2u88jshw77s292ldns72gfh3k328hjl28x";
       return Column(
         children: [
           Container(
@@ -495,13 +628,13 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Row(
-                children: const [
-                  Icon(Icons.currency_bitcoin, color: FoodChainTheme.primaryOrange, size: 16),
-                  SizedBox(width: 8),
+                children: [
+                  const Icon(Icons.currency_bitcoin, color: FoodChainTheme.primaryOrange, size: 16),
+                  const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       address,
-                      style: TextStyle(
+                      style: const TextStyle(
                         fontFamily: 'Outfit',
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
@@ -510,8 +643,8 @@ class _CompletePaymentScreenState extends State<CompletePaymentScreen> {
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  SizedBox(width: 8),
-                  Icon(Icons.copy, size: 14, color: Colors.grey),
+                  const SizedBox(width: 8),
+                  const Icon(Icons.copy, size: 14, color: Colors.grey),
                 ],
               ),
             ),
